@@ -1,15 +1,19 @@
-//new
+//newone
 
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
+const NodeCache = require("node-cache");
+const axiosRetry = require("axios-retry").default;
+const Queue = require("better-queue");
 
 const app = express();
 const port = process.env.PORT || 3001;
 const API_VERSION = "1.0.0";
 const CMC_API_KEY = process.env.CMC_API_KEY;
+const cache = new NodeCache({ stdTTL: 3600 }); // Cache for 15 minutes
 
 const getTimestamp = () => new Date().getTime();
 
@@ -27,7 +31,7 @@ app.use(cors(corsOptions));
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: 100, // limit each IP to 50 requests per windowMs
 });
 app.use(limiter);
 
@@ -37,48 +41,92 @@ app.use((req, res, next) => {
   next();
 });
 
+//retry
+axiosRetry(axios, {
+  retries: 3,
+  retryDelay: axiosRetry.exponentialDelay,
+});
+
+const apiQueue = new Queue(
+  async (task, callback) => {
+    try {
+      const response = await axios.get(
+        `https://pro-api.coinmarketcap.com/v1/${task.endpoint}`,
+        {
+          headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
+          params:
+            task.endpoint === "exchange/info"
+              ? task.params
+              : { ...task.params, convert: "USD" },
+        }
+      );
+      callback(null, response.data);
+    } catch (error) {
+      callback(error);
+    }
+  },
+  { concurrent: 1, interval: 1000 }
+);
+
 // Helper function for CoinMarketCap API calls
 async function fetchFromCMC(endpoint, params = {}) {
+  const cacheKey = `${endpoint}-${JSON.stringify(params)}`;
+  const cachedData = cache.get(cacheKey);
+
+  if (cachedData) {
+    return cachedData;
+  }
+
   try {
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await delay(1000);
     const response = await axios.get(
       `https://pro-api.coinmarketcap.com/v1/${endpoint}`,
       {
         headers: { "X-CMC_PRO_API_KEY": CMC_API_KEY },
-        params: { ...params, convert: "USD" },
+        params:
+          endpoint === "exchange/info" ? params : { ...params, convert: "USD" },
       }
     );
+    cache.set(cacheKey, response.data);
     return response.data;
   } catch (error) {
     console.error(
       `Error fetching data from CoinMarketCap API (${endpoint}):`,
       error
     );
-    throw error;
+
+    // If the direct request fails, try using the queue as a fallback
+    return new Promise((resolve, reject) => {
+      apiQueue.push({ endpoint, params }, (err, result) => {
+        if (err) {
+          console.error(
+            `Queue error fetching data from CoinMarketCap API (${endpoint}):`,
+            err
+          );
+          reject(err);
+        } else {
+          cache.set(cacheKey, result);
+          resolve(result);
+        }
+      });
+    });
   }
 }
 
 // Fetch latest cryptocurrency data
 app.get("/api/cryptocurrencies", async (req, res) => {
   try {
-    const response = await axios.get(
-      "http://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
-      {
-        headers: {
-          "X-CMC_PRO_API_KEY": CMC_API_KEY,
-        },
-        params: {
-          start: 1,
-          limit: 100,
-          convert: "USD",
-        },
-      }
-    );
+    const data = await fetchFromCMC("cryptocurrency/listings/latest", {
+      start: 1,
+      limit: 100,
+    });
 
-    response.data.data.forEach((crypto) => {
+    data.data.forEach((crypto) => {
       crypto.logo = `https://s2.coinmarketcap.com/static/img/coins/64x64/${crypto.id}.png`;
     });
 
-    res.json(response.data);
+    res.json(data);
   } catch (error) {
     console.error("Error fetching data from CoinMarketCap API:", error.message);
     res.status(500).json({ error: "Failed to fetch data" });
@@ -92,6 +140,7 @@ app.get("/api/trending", async (req, res) => {
       start: 1,
       limit: 100,
     });
+
     const trendingData = data.data
       .sort(
         (a, b) =>
@@ -126,6 +175,7 @@ app.get("/api/top-gainers", async (req, res) => {
       sort: "percent_change_24h",
       sort_dir: "desc",
     });
+
     const topGainers = data.data.map((crypto) => ({
       id: crypto.id,
       name: crypto.name,
@@ -157,6 +207,7 @@ app.get("/api/top-losers", async (req, res) => {
       sort: "percent_change_24h",
       sort_dir: "asc",
     });
+
     const topLosers = data.data.map((crypto) => ({
       id: crypto.id,
       name: crypto.name,
@@ -187,6 +238,7 @@ app.get("/api/cryptocurrencies/:id", async (req, res) => {
       start: 1,
       limit: 100,
     });
+
     const crypto = data.data.find((c) => c.id == cryptoId);
 
     if (crypto) {
@@ -215,9 +267,7 @@ app.get("/api/price-performance/:id", async (req, res) => {
   const cryptoId = req.params.id.toLowerCase();
 
   if (!cryptoId) {
-    return res
-      .status(400)
-      .json({ error: "Invalid cryptocurrency ID", timestamp: getTimestamp() });
+    return res.status(400).json({ error: "Invalid cryptocurrency ID" });
   }
 
   try {
@@ -271,6 +321,59 @@ app.get("/api/price-performance/:id", async (req, res) => {
   }
 });
 
+// Fetch exchange data from CoinGecko API
+app.get("/api/exchanges", async (req, res) => {
+  const cacheKey = "exchanges";
+  const cachedData = cache.get(cacheKey);
+
+  if (cachedData) {
+    return res.json({
+      version: API_VERSION,
+      timestamp: getTimestamp(),
+      data: cachedData,
+    });
+  }
+
+  try {
+    const url = "https://api.coingecko.com/api/v3/exchanges";
+    const response = await fetchFromCoinGecko(url);
+
+    // Transform the response to match your expected format if needed
+    const exchangeData = response.map((exchange) => ({
+      id: exchange.id,
+      name: exchange.name,
+      year_established: exchange.year_established,
+      country: exchange.country,
+      description: exchange.description,
+      url: exchange.url,
+      image: exchange.image,
+      has_trading_incentive: exchange.has_trading_incentive,
+      trust_score: exchange.trust_score,
+      trust_score_rank: exchange.trust_score_rank,
+      trade_volume_24h_btc: exchange.trade_volume_24h_btc,
+      trade_volume_24h_btc_normalized: exchange.trade_volume_24h_btc_normalized,
+    }));
+
+    // Cache the data
+    cache.set(cacheKey, exchangeData);
+
+    res.json({
+      version: API_VERSION,
+      timestamp: getTimestamp(),
+      data: exchangeData,
+    });
+  } catch (error) {
+    console.error(
+      "Error fetching exchange data from CoinGecko API:",
+      error.message
+    );
+    res.status(500).json({
+      error: "Failed to fetch exchange data",
+      message: error.message,
+      timestamp: getTimestamp(),
+    });
+  }
+});
 // Add a simple endpoint to check API freshness
 app.get("/api/fresh", (req, res) => {
   res.json({
