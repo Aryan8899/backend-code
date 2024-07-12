@@ -1,5 +1,7 @@
+
+
 {
-  "name": "crypto-api-server",
+  "name": "crypto-api-serve",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
