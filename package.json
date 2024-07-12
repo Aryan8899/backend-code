@@ -1,7 +1,7 @@
 
 
 {
-  "name": "crypto-api-serve",
+  "name": "crypto-api-server",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -24,6 +24,7 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.3.1",
     "node-cache": "^5.1.2",
-    "react-router-dom": "^6.23.1"
+    "react-router-dom": "^6.23.1",
+    "mongoose": "^8.4.4"  
   }
 }
