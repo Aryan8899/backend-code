@@ -6,13 +6,16 @@ require("dotenv").config();
 const app = express();
 const PORT = 5000;
 
+
+//umVoRpkC50LuPpLh
 // Middleware
 app.use(cors());
 app.use(express.json()); // Parse JSON bodies
 
 // MongoDB Connection
 require("dotenv").config();
-const uri = "mongodb://localhost:27017/News";
+const uri =
+  "mongodb+srv://aryanpandita003:i5rEpY08BANOZ6TL@news.jb66uan.mongodb.net/";
 
 const options = {
   useNewUrlParser: true,
